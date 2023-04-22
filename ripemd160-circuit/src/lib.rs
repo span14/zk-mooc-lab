@@ -10,6 +10,10 @@ use halo2_proofs::{
     plonk::{Advice, Any, Column, ConstraintSystem, Error},
 };
 
+mod gates;
+mod spread_table;
+mod utils;
+
 #[derive(Clone, Debug)]
 pub struct Ripemd160Table {
     id: Column<Advice>,

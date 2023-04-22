@@ -68,7 +68,20 @@ use halo2_proofs::{
     arithmetic::FieldExt,
     circuit::Layouter,
     plonk::{Advice, Any, Column, ConstraintSystem, Error},
+    poly::Rotation,
 };
+
+mod gates;
+mod regions;
+mod spread_table;
+mod utils;
+
+use spread_table::SpreadTableConfig;
+use regions::{
+    compression::CompressionChip, 
+    message_schedule::MessageScheduleChip
+};
+
 
 #[derive(Clone, Debug)]
 pub struct Sha2Table {
@@ -92,15 +105,72 @@ impl Sha2Table {
 }
 
 #[derive(Clone, Debug)]
-pub struct Sha2Config<F> {
+pub struct Sha2Config<F: FieldExt> {
     table: Sha2Table,
+    cols: Vec<Column<Advice>>,
+    spread_table: SpreadTableConfig<F, 16>,
+    compression_chip: CompressionChip<F>,
+    message_schedule_chip: MessageScheduleChip<F>,
     _marker: PhantomData<F>,
 }
 
 impl<F: FieldExt> Sha2Config<F> {
-    pub fn configure(meta: &mut ConstraintSystem<F>, table: Sha2Table) -> Self {
+    pub fn configure(
+        meta: &mut ConstraintSystem<F>, 
+        table: Sha2Table,
+    ) -> Self {
+        let mut cols: Vec<Column<Advice>> = vec![];
+        for i in 0..10 {
+            cols.push(meta.advice_column());
+            meta.enable_equality(cols[i]);
+        }
+        let spread_table = SpreadTableConfig::configure(meta);
+        let compression_chip = CompressionChip::configure(
+            meta, 
+            cols[0], cols[1], cols[2], cols[3], cols[4], 
+            cols[5], cols[6], cols[7], cols[8], cols[9]
+        );
+        let message_schedule_chip = MessageScheduleChip::configure(
+            meta, cols[0], cols[1], cols[2], cols[3], cols[4], 
+            cols[5], cols[6], cols[7], cols[8], cols[9]
+        );
+        
+        meta.lookup(
+            "Consistent Lookup 1", 
+            |table| {
+                let a0 = table.query_advice(cols[0], Rotation::cur());
+                let a1 = table.query_advice(cols[1], Rotation::cur());
+                let a2 = table.query_advice(cols[2], Rotation::cur());
+
+                vec![
+                    (a0, spread_table.tag),
+                    (a1, spread_table.table),
+                    (a2, spread_table.spread)
+                ]
+            }
+        );
+
+        meta.lookup("Consistent Lookup 2", |table| {
+
+            let sd_abc = table.query_selector(compression_chip.sd_abc.s_abc);
+            let sd_efg = table.query_selector(compression_chip.sd_efg.s_efg);
+            let a7 = table.query_advice(cols[7], Rotation::cur());
+            let a8 = table.query_advice(cols[8], Rotation::cur());
+
+            let flag = sd_abc.clone() + sd_efg.clone() + sd_abc * sd_efg;
+
+            vec![
+                (flag.clone() * a7, spread_table.table),
+                (flag * a8,         spread_table.spread),
+            ]
+        });
+
         Self {
             table,
+            cols,
+            compression_chip,
+            message_schedule_chip,
+            spread_table,
             _marker: PhantomData,
         }
     }
@@ -113,7 +183,7 @@ pub struct Sha2Witness<F> {
 }
 
 #[derive(Clone, Debug)]
-pub struct Sha2Chip<F> {
+pub struct Sha2Chip<F: FieldExt> {
     config: Sha2Config<F>,
     data: Sha2Witness<F>,
 }
@@ -124,6 +194,86 @@ impl<F: FieldExt> Sha2Chip<F> {
     }
 
     pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+
+        let k = [   
+            0x428a2f98u32, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+        ].into_iter().fold(vec![], |mut l, elem| {
+            l.push(elem as u16);
+            l.push((elem >> 16) as u16);
+            l
+        });
+
+        let h = [
+            0x6a09e667u32,
+            0xbb67ae85,
+            0x3c6ef372,
+            0xa54ff53a,
+            0x510e527f,
+            0x9b05688c,
+            0x1f83d9ab,
+            0x5be0cd19
+        ].into_iter().fold(vec![], |mut l, elem| {
+            l.push(elem as u16);
+            l.push((elem >> 16) as u16);
+            l
+        });
+        
+        let mut idx = 0;
+        for input in self.data.inputs.iter() {
+
+            let l: u64 = self.data.inputs[0].len() as u64;
+        
+            let coef = (l+1+8) / 64;
+            let rem = (l+1+8) % 64;
+            let size = coef * 64 + (rem > 0) as u64 * 64;
+            let num_zeros = size - self.data.inputs[0].len() as u64 - 1 - 8;
+            let mut copy = self.data.inputs[0].clone();
+            copy.extend([0x80]);
+            copy.extend(vec![0; num_zeros as usize]);
+            copy.extend((l*8).to_be_bytes());
+            let mut w: Vec<u16> = vec![];
+            for i in 0..copy.len()/4 {
+                w.push( copy[4*i+3] as u16 + (copy[4*i+2] as u16) * ( 1 << 8) );
+                w.push( copy[4*i+1] as u16 + (copy[4*i+0] as u16) * ( 1 << 8) );
+            }
+
+            layouter.assign_region(
+                || format!("Full SHA256 {}", idx), 
+                |mut region| {
+                    let k = k.clone();
+                    let w = w.clone();
+                    let h = h.clone();
+
+                    let mut h_val = vec![];
+                    let mut h_c = vec![];
+                    for i in 0..w.len()/32 {
+                        let mut w_p = vec![0; 32];
+                        w_p.copy_from_slice(&w[32*i..32*(i+1)]);
+                        let (w_val, w_c) = self.config.message_schedule_chip.load(&mut region, w_p, 2099 * i)?;
+                        if i == 0 {
+                            (h_val, h_c) = self.config.compression_chip.load(&mut region, w_c, w_val, k.clone(), h.clone(), 2099 * i + 547)?;
+                        } else {
+                            // let (w_val, w_c) = self.config.message_schedule_chip.load(&mut region, w_p, 2099 * (i+1))?;
+                            (h_val, h_c) = self.config.compression_chip.load_steady(
+                                &mut region, w_c, w_val, k.clone(), 
+                                h_c, h_val, 2099 * i + 547
+                            )?;
+                        }
+                    }
+                    
+                    Ok(())
+                }
+            )?;
+            idx += 1;
+        }
+
         Ok(())
     }
 }
@@ -192,6 +342,7 @@ pub mod dev {
             config: Self::Config,
             mut layouter: impl Layouter<F>,
         ) -> Result<(), Error> {
+            config.spread_table.load(&mut layouter)?;
             let chip = Sha2Chip::construct(
                 config,
                 Sha2Witness {
@@ -199,7 +350,8 @@ pub mod dev {
                     _marker: PhantomData,
                 },
             );
-            chip.load(&mut layouter)
+            chip.load(&mut layouter)?;
+            Ok(())
         }
     }
 }
@@ -221,8 +373,9 @@ mod tests {
             _marker: PhantomData,
         };
 
-        let k = 8;
+        let k = 17;
         let prover = MockProver::run(k, &circuit, vec![]).unwrap();
+        // prover.assert_satisfied();
         assert_eq!(prover.verify(), Ok(()));
     }
 }
